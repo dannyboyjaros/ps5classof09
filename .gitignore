@@ -1,0 +1,20 @@
+# build outputs, dependencies and the user's own game data
+kit/assets/
+kit/dist/
+kit/build/
+kit/.deps/
+kit/out/
+kit/build-cmake/
+build/
+build-cmake/
+dist/
+out/
+*.zip
+*.o
+*.elf
+*.prx
+*.bin
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
