@@ -42,6 +42,7 @@ enum {
     FONT_MONO,
     FONT_PHONE,
     FONT_BODY_TINY,
+    FONT_TRACKER,
     FONT_COUNT
 };
 

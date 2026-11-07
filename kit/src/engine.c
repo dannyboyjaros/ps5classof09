@@ -2238,12 +2238,12 @@ static void on_back(Engine *e) {
 static void on_nav(Engine *e, int delta) {
     if (e->mode == MODE_ENDINGS) {
         if (e->endings_detail) {
-            e->endings_scroll += delta * 80;
+            e->endings_scroll += delta * 40;
             if (e->endings_scroll < 0) {
                 e->endings_scroll = 0;
             }
-            if (e->endings_scroll > 1600) {
-                e->endings_scroll = 1600;
+            if (e->endings_scroll > 600) {
+                e->endings_scroll = 600;
             }
         } else if (e->seen_count > 0) {
             e->endings_index = wrap_index(e->endings_index + delta, e->seen_count);
@@ -3023,14 +3023,14 @@ static void draw_endings(Engine *e) {
     struct tm *clock_now;
     JsonValue *item;
 
-    /* The PDA photo is 1920x1080; the game's transform zooms it to 1.7 and
-     * centers it. 2.05 keeps the messaging screen inside the phone's display. */
-    draw_image(e, "gui/ending_tracker/ending_tracker_pda.png", -1000, -596, 3936, 2214, 255, 0);
-    draw_image(e, "gui/ending_tracker/base_screen.png", 0, 0, SCREEN_W, SCREEN_H, 255, 0);
+    /* Show the whole Sidekick photo, and shrink the messaging UI into the
+     * phone's display instead of zooming the photo to fill the screen. */
+    draw_image(e, "gui/ending_tracker/ending_tracker_pda.png", 0, 0, SCREEN_W, SCREEN_H, 255, 0);
+    draw_image(e, "gui/ending_tracker/base_screen.png", 460, 274, 989, 556, 255, 0);
 
     snprintf(text, sizeof(text), "%d/%d", e->seen_count, total);
-    draw_text(e, FONT_MONO, text, 0x2370BE, 0, 407, 131, 0, 0);
-    draw_text(e, FONT_MONO, text, 0xFFFFFF, 0, 405, 129, 0, 0);
+    draw_text(e, FONT_TRACKER, text, 0x2370BE, 0, 670, 342, 0, 0);
+    draw_text(e, FONT_TRACKER, text, 0xFFFFFF, 0, 668, 340, 0, 0);
 
     now = time(NULL);
     clock_now = localtime(&now);
@@ -3040,16 +3040,16 @@ static void draw_endings(Engine *e) {
             hour = 12;
         }
         snprintf(text, sizeof(text), "%02d:%02d", hour, clock_now->tm_min);
-        draw_text(e, FONT_MONO, text, 0x0000CC, 0, 1240, 62, 0, 0);
+        draw_text(e, FONT_TRACKER, text, 0x0000CC, 0, 1098, 305, 0, 0);
     }
 
     if (e->endings_detail) {
         item = seen_ending_at(e, e->endings_index);
         if (item) {
-            draw_text(e, FONT_BODY_TINY, obj_str(item, "text", ""), 0x000000, 1230, 270,
-                      250 - e->endings_scroll, 0, 6);
+            draw_text(e, FONT_TRACKER, obj_str(item, "text", ""), 0x000000, 633, 599,
+                      403 - (int)(e->endings_scroll * 0.515), 0, 4);
         }
-        draw_text(e, FONT_SMALL, "D-pad: scroll   Cross / Circle: back", 0x2370BE, 0, 280, 940, 0, 0);
+        draw_text(e, FONT_TRACKER, "D-pad: scroll   Cross / Circle: back", 0x2370BE, 0, 604, 758, 0, 0);
         return;
     }
 
@@ -3073,25 +3073,25 @@ static void draw_endings(Engine *e) {
             last = e->seen_count;
         }
         for (i = e->endings_top; i < last; i++) {
-            int y = 230 + (i - e->endings_top) * 70;
+            int y = 392 + (i - e->endings_top) * 36;
             item = seen_ending_at(e, i);
             if (!item) {
                 continue;
             }
             if (i == e->endings_index) {
-                draw_image(e, "gui/ending_tracker/highlight_bar.png", 260, y, 1288, 70, 255, 0);
+                draw_image(e, "gui/ending_tracker/highlight_bar.png", 593, y, 663, 36, 255, 0);
             }
             snprintf(row, sizeof(row), "%s", obj_str(item, "title", "UNKNOWN"));
-            if (strlen(row) > 36) {
-                copy_str(row + 33, 4, "...");
+            if (strlen(row) > 26) {
+                copy_str(row + 23, 4, "...");
             }
-            draw_text(e, FONT_PHONE, row, i == e->endings_index ? 0xFFFFFF : 0x000000, 0, 285, y + 10, 0, 0);
+            draw_text(e, FONT_TRACKER, row, i == e->endings_index ? 0xFFFFFF : 0x000000, 0, 606, y + 5, 0, 0);
         }
     }
     if (e->seen_count == 0) {
-        draw_text(e, FONT_PHONE, "No endings collected yet.", 0x000000, 0, 285, 240, 0, 0);
+        draw_text(e, FONT_TRACKER, "No endings collected yet.", 0x000000, 0, 606, 392, 0, 0);
     }
-    draw_text(e, FONT_SMALL, "D-pad: choose/scroll   Cross: read   Circle: back", 0x2370BE, 0, 280, 940, 0, 0);
+    draw_text(e, FONT_TRACKER, "D-pad: choose/scroll   Cross: read   Circle: back", 0x2370BE, 0, 604, 758, 0, 0);
 }
 
 static void draw_toast(Engine *e) {
@@ -3264,9 +3264,11 @@ static void load_gui(Engine *e) {
     copy_str(e->font_paths[FONT_MONO], MAX_PATH, "joystix monospace.ttf");
     copy_str(e->font_paths[FONT_PHONE], MAX_PATH, "texting2007.ttf");
     copy_str(e->font_paths[FONT_BODY_TINY], MAX_PATH, "HELVETICA_LT_NARROW.TTF");
+    copy_str(e->font_paths[FONT_TRACKER], MAX_PATH, "HELVETICA_LT_NARROW.TTF");
     e->font_sizes[FONT_MONO] = 48;
     e->font_sizes[FONT_PHONE] = 40;
     e->font_sizes[FONT_BODY_TINY] = 26;
+    e->font_sizes[FONT_TRACKER] = 20;
 
     if (gui && gui->type == JL_OBJECT) {
         copy_str(e->gui_textbox, sizeof(e->gui_textbox), obj_str(gui, "textbox", e->gui_textbox));
