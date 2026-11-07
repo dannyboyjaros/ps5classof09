@@ -265,6 +265,7 @@ if [[ -n ${pacbrew_root:-} ]]; then
 fi
 ninja_edge LINK "$build/llvm-pie.elf" "$sdk_root/bin/prospero-lld" -T "$native/ps5-pie.ld" --eh-frame-hdr \
     "${wrap_options[@]}" --version-script "$native/app-symbols.map" \
+    -L"$sdk_root/target/lib" \
     -e _start -o "$build/llvm-pie.elf" "${link_inputs[@]}" \
     --as-needed "${stub_paths[@]}" "$sdk_root"/target/lib/*.so
 ninja_inputs=("$build/llvm-pie.elf" "$tool" "${stub_paths[@]}" "$sdk_root"/target/lib/*.so)

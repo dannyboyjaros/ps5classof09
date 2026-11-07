@@ -7,6 +7,7 @@
 #include <SDL_image.h>
 #include <SDL_mixer.h>
 #include <SDL_ttf.h>
+#include <pthread.h>
 
 /* The game is authored for a 1920x1080 virtual screen. */
 #define SCREEN_W 1920
@@ -244,6 +245,24 @@ typedef struct {
     Mix_Music *intro_music;
     int splash_frames;
     Uint32 splash_skip_at;
+    int splash_is_webm;
+    void *splash_webm;
+
+    /* one decode thread shared by the splash and the perc-pop overlay */
+    pthread_t decode_thread;
+    int decode_thread_live;
+    volatile int decode_thread_stop;
+    void *decode_player;
+    Uint32 decode_start;
+    int decode_loop;
+    pthread_mutex_t decode_mutex;
+    int decode_mutex_ready;
+    unsigned char *decode_buf[2];
+    size_t decode_buf_size;
+    int decode_buf_index;
+    int decode_buf_serial;
+    int decode_buf_w;
+    int decode_buf_h;
 
     /* full-screen "perc pop" movie overlay */
     int percpop_active;
@@ -252,7 +271,14 @@ typedef struct {
     int percpop_index;
     Uint32 percpop_start;
     SDL_Texture *percpop_tex;
+    int percpop_tex_w;
+    int percpop_tex_h;
     char percpop_dir[SAVE_PATH_MAX];
+    int percpop_is_webm;
+    void *percpop_webm;
+    int percpop_w;
+    int percpop_h;
+    double percpop_duration;
     int splash_fps;
     int splash_w;
     int splash_h;
@@ -260,6 +286,8 @@ typedef struct {
     char splash_dir[SAVE_PATH_MAX];
     SDL_Texture *splash_tex;
     int splash_tex_index;
+    int splash_tex_w;
+    int splash_tex_h;
 
     /* transient status line */
     Uint32 toast_until;

@@ -1,86 +1,74 @@
-# Extracting the videos
+# Videos
 
-The PS5 runtime has no VP8/Vorbis decoder. Every `.webm` used by the game is
-converted into a directory of JPEG frames plus a small manifest and, when the
-video has sound, an MP3. The player reads the frames in order at the manifest's
-frame rate.
+The PS5 runtime decodes the game's original `.webm` files directly. There is no
+frame-extraction step and no `assets/videos/` tree to generate.
 
-A generated video directory looks like this:
+## How it plays
 
-```
-kit/assets/videos/<name>/
-  manifest.txt      fps=24 / frames=N / width=960 / height=540
-  frame_0000.jpg
-  frame_0001.jpg
-  ...
-  audio.mp3         (only when the source has audio)
-```
+- The container is demuxed by `kit/src/webm.c` (a small EBML/Matroska parser
+  that handles Segment, Info, Tracks, Cluster, SimpleBlock/Block and Xiph
+  lacing).
+- VP8 video is decoded with **libvpx**; Vorbis audio with **libvorbis** and
+  **libogg**.
+- Frames are decoded on a dedicated thread for the current playback timestamp.
+  The thread publishes each finished RGBA frame into a double buffer, and the
+  render thread only copies the newest frame into a texture, so the menu and
+  dialogue never block on VP8 decoding.
+- The decoder skips intermediate frames: it decodes only the blocks needed to
+  reach the requested timestamp and converts just the final frame to RGBA.
+- Audio is decoded once at the start of playback to a temporary WAV in the save
+  directory (`video_audio.wav`), loaded with `Mix_LoadMUS`, and the WAV is
+  deleted. That keeps the mixer on its existing MP3/WAV path.
 
-The engine plays `logosplash`, `opening`, and `endings/<id>` as full-screen
-movies, and `percpop` as a screens-layer overlay. All of them use the same
-frame sequence format, so any of them can be regenerated independently.
+The libraries come from the PacBrew ports prefix. `kit/build_class09.sh` selects
+them automatically:
 
-## Frame extraction
-
-Set `FFMPEG` to an ffmpeg build that can decode VP8 (a full build with libvpx is
-easiest), then from the repository root:
-
-```bash
-GAME="<path to Class of 09>/game"
-OUT=kit/assets/videos
-
-# startup logo: 252 frames at 30 fps, 1920x1080, with sound
-ffmpeg -y -i "$GAME/logosplash.webm" \
-    -vf "fps=30" -q:v 3 -start_number 0 "$OUT/logosplash/frame_%04d.jpg"
-ffmpeg -y -i "$GAME/logosplash.webm" -vn -ac 2 -ar 44100 \
-    -c:a libmp3lame -b:a 128k "$OUT/logosplash/audio.mp3"
-
-# New Game intro: 24 fps, 960x540, with sound
-ffmpeg -y -i "$GAME/opening.webm" \
-    -vf "fps=24,scale=960:540:flags=bicubic" -q:v 65 \
-    -start_number 0 "$OUT/opening/frame_%04d.jpg"
-ffmpeg -y -i "$GAME/opening.webm" -vn -ac 2 -ar 44100 \
-    -c:a libmp3lame -b:a 128k "$OUT/opening/audio.mp3"
-
-# perc-pop overlay: 24 fps, 960x540, silent
-ffmpeg -y -i "$GAME/percpop.webm" \
-    -vf "fps=24,scale=960:540:flags=bicubic" -q:v 68 \
-    -start_number 0 "$OUT/percpop/frame_%04d.jpg"
-
-# all fifteen endings
-for f in "$GAME"/*end.webm; do
-    id=$(basename "$f" end.webm)
-    mkdir -p "$OUT/endings/$id"
-    ffmpeg -y -i "$f" -vf "fps=20,scale=960:540:flags=bicubic" -q:v 65 \
-        -start_number 0 "$OUT/endings/$id/frame_%04d.jpg"
-    ffmpeg -y -i "$f" -vn -ac 2 -ar 44100 -c:a libmp3lame -b:a 128k \
-        "$OUT/endings/$id/audio.mp3"
-done
+```sh
+PACBREW_PACKAGES='vpx vorbis ogg'
 ```
 
-The startup logo and opening use 30/24 fps because they are short; the endings
-use 20 fps to keep the 15 videos compact and to match the software player's
-decode budget. The frame sizes (960x540) are upscaled to 1920x1080 by the
-renderer.
+`tools/setup-pacbrew-dependencies.sh` downloads the pinned prefix (about 346 MB)
+on the first build and caches it in `kit/.deps/pacbrew`.
 
-## Manifests
+## Files the runtime uses
 
-Create a `manifest.txt` next to the frames with the real counts:
+These must be in `assets/game/` (they are listed in `GAME_FILES.txt`):
 
-```bash
-printf 'fps=24\nframes=%d\nwidth=960\nheight=540\n' \
-    "$(ls "$OUT/opening" | grep -c '^frame_.*\.jpg$')" \
-    > "$OUT/opening/manifest.txt"
+```
+logosplash.webm      startup logo (8.6 s, with audio)
+opening.webm         New Game intro (140 s, with audio)
+percpop.webm         perc-pop overlay (5.9 s, silent)
+0039end.webm         ending 0039   (with audio)
+0063end.webm         ending 0063
+0074end.webm         ending 0074
+0091end.webm         ending 0091
+0103end.webm         ending 0103
+0105end.webm         ending 0105
+0121end.webm         ending 0121
+0126end.webm         ending 0126
+0127end.webm         ending 0127
+0144end.webm         ending 0144
+0145end.webm         ending 0145
+0153end.webm         ending 0153
+0161end.webm         ending 0161
+0169end.webm         ending 0169
+0173end.webm         ending 0173
 ```
 
-Repeat for each directory, using its own frame rate and size (the logosplash
-manifest uses 30 fps and 1920x1080). The runtime refuses a directory whose
-manifest frame count does not match an existing `frame_0000.jpg` or whose frame
-count is out of range.
+The ending videos are opened by ID: the script's `ending` op for `0039` opens
+`<game_dir>/0039end.webm`.
 
-## Ending IDs
+## Optional legacy fallback
 
-The ending directory names are the four-digit ending IDs from the script:
-`0039, 0063, 0074, 0091, 0103, 0105, 0121, 0126, 0127, 0144, 0145, 0153, 0161,
-0169, 0173`. The runtime looks up `videos/endings/<id>/` when the script reaches
-an `ending` op, and plays the ending text card after the video finishes.
+If a `.webm` file is missing, the engine falls back to the older frame-sequence
+player and looks for `assets/videos/<name>/` with a `manifest.txt` and
+`frame_0000.jpg` (or `assets/videos/endings/<id>/`). That fallback is only for
+old deployments; a normal install needs no video folders at all.
+
+## Performance
+
+VP8 is decoded in software on the PS5 CPU. Decoding runs on its own thread and
+only publishes finished frames, so a 1080p cutscene decodes at roughly 18–25
+fps while the game itself keeps running at 59.9 fps. The perc-pop overlay is
+short and silent, and ending videos are left unskippable so they always play
+through.

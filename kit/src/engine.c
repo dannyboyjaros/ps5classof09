@@ -1,6 +1,11 @@
 #include "engine.h"
 #include "ps5_trace.h"
 
+#ifdef __PROSPERO__
+#include "webm.h"
+#include <unistd.h>
+#endif
+
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -726,6 +731,7 @@ static Mix_Chunk *load_loop_chunk(Engine *e, int ch, const char *rel) {
     join_path(full, sizeof(full), e->game_dir, rel);
     *slot = Mix_LoadWAV(full);
     if (!*slot) {
+        c09_trace("audio: loop load failed: %s (%s)", full, Mix_GetError());
         stored[0] = 0;
         return NULL;
     }
@@ -755,6 +761,9 @@ static void play_chunk(Engine *e, const char *channel, const char *rel, double f
         Mix_PlayChannel(ch, chunk, loop ? -1 : 0);
     }
     Mix_Volume(ch, (ch <= 1 ? e->opt_music : 8) * MIX_MAX_VOLUME / 10);
+    if (ch <= 1) {
+        c09_trace("audio: %s = %s (loop=%d)", channel, rel, loop);
+    }
 }
 
 static void stop_channel(Engine *e, const char *channel, double fade) {
@@ -1516,6 +1525,8 @@ static int eval_cond(Engine *e, const char *cond) {
 }
 
 static int load_movie(Engine *e, const char *subdir, int mode);
+static int load_webm_movie(Engine *e, const char *path, int mode);
+static int load_ending_video(Engine *e, const char *id);
 
 static void begin_ending(Engine *e, const char *id) {
     int i;
@@ -1540,18 +1551,15 @@ static void begin_ending(Engine *e, const char *id) {
     stop_channel(e, "ambient", 0);
     stop_channel(e, "music", 0);
     if (id && id[0]) {
-        char subdir[64];
-        int loaded;
-        snprintf(subdir, sizeof(subdir), "videos/endings/%s", id);
         c09_trace("ending: id=%s text=%s", id, e->ending_title);
-        loaded = load_movie(e, subdir, 2);
-        c09_trace("ending: video %s loaded=%d", subdir, loaded);
-        if (loaded) {
+        if (load_ending_video(e, id)) {
+            c09_trace("ending: video for %s started", id);
             e->waiting = 0;
             e->wait_auto = 0;
             e->wait_kind = WAIT_NONE;
             return;
         }
+        c09_trace("ending: no video for %s", id);
     }
     e->waiting = 1;
     e->wait_auto = 0;
@@ -3349,6 +3357,10 @@ static void load_fonts(Engine *e) {
 }
 
 static void load_splash(Engine *e);
+#ifdef __PROSPERO__
+static void stop_webm(Engine *e);
+static void stop_decode_thread(Engine *e);
+#endif
 
 /* ------------------------------------------------------------------------- */
 /* lifecycle                                                                 */
@@ -3529,6 +3541,15 @@ void engine_shutdown(Engine *e) {
     if (!e) {
         return;
     }
+#ifdef __PROSPERO__
+    stop_decode_thread(e);
+    stop_webm(e);
+    free(e->decode_buf[0]);
+    free(e->decode_buf[1]);
+    e->decode_buf[0] = NULL;
+    e->decode_buf[1] = NULL;
+    e->decode_buf_size = 0;
+#endif
     if (e->intro_music) {
         Mix_HaltMusic();
         Mix_FreeMusic(e->intro_music);
@@ -3711,7 +3732,227 @@ static int load_splash_dir(Engine *e, const char *subdir, int mode) {
 
 static void start_movie_audio(Engine *e);
 
+#ifdef __PROSPERO__
+/* VP8 decoding runs on its own core so drawing never performs a decode. The
+ * thread decodes to the wall clock; the render thread only copies the latest
+ * converted RGBA frame. */
+static void *webm_decode_thread(void *arg) {
+    Engine *e = (Engine *)arg;
+    WebmPlayer *player = (WebmPlayer *)e->decode_player;
+    while (!e->decode_thread_stop && e->decode_player == player) {
+        Uint32 now = SDL_GetTicks();
+        double t = (double)(now - e->decode_start) / 1000.0;
+        double duration = webm_duration(player);
+        const unsigned char *rgba = NULL;
+        int width = 0;
+        int height = 0;
+        int serial = 0;
+        if (e->decode_loop && duration > 0.01) {
+            while (t >= duration) {
+                t -= duration;
+            }
+        }
+        if (t < 0.0) {
+            t = 0.0;
+        }
+        /* Decode without the lock; only publishing the frame takes it. */
+        if (webm_frame(player, t, &rgba, &width, &height, &serial) && rgba &&
+            width > 0 && height > 0) {
+            size_t need = (size_t)width * (size_t)height * 4u;
+            pthread_mutex_lock(&e->decode_mutex);
+            if (e->decode_buf_size < need) {
+                unsigned char *a = (unsigned char *)realloc(e->decode_buf[0], need);
+                unsigned char *b = (unsigned char *)realloc(e->decode_buf[1], need);
+                if (a) {
+                    e->decode_buf[0] = a;
+                }
+                if (b) {
+                    e->decode_buf[1] = b;
+                }
+                if (a && b) {
+                    e->decode_buf_size = need;
+                }
+            }
+            if (e->decode_buf_size >= need) {
+                int back = 1 - e->decode_buf_index;
+                memcpy(e->decode_buf[back], rgba, need);
+                e->decode_buf_index = back;
+                e->decode_buf_serial = serial;
+                e->decode_buf_w = width;
+                e->decode_buf_h = height;
+            }
+            pthread_mutex_unlock(&e->decode_mutex);
+        }
+        usleep(4000);
+    }
+    return NULL;
+}
+
+static void stop_decode_thread(Engine *e) {
+    if (e->decode_thread_live) {
+        e->decode_thread_stop = 1;
+        pthread_join(e->decode_thread, NULL);
+        e->decode_thread_live = 0;
+    }
+    e->decode_thread_stop = 0;
+    e->decode_player = NULL;
+}
+
+static void start_decode_thread(Engine *e, void *player, Uint32 start, int loop) {
+    stop_decode_thread(e);
+    if (!e->decode_mutex_ready) {
+        pthread_mutex_init(&e->decode_mutex, NULL);
+        e->decode_mutex_ready = 1;
+    }
+    e->decode_player = player;
+    e->decode_start = start;
+    e->decode_loop = loop;
+    e->decode_thread_stop = 0;
+    e->decode_buf_serial = -1;
+    e->decode_buf_index = 0;
+    if (pthread_create(&e->decode_thread, NULL, webm_decode_thread, e) == 0) {
+        e->decode_thread_live = 1;
+        c09_trace("webm: decode thread started");
+    }
+}
+
+/* Uploads a video frame into a persistent streaming texture. Creating the
+ * texture once and updating it avoids a surface + texture allocation for every
+ * displayed frame. */
+static void webm_upload(Engine *e, SDL_Texture **tex, int *tex_w, int *tex_h,
+                        const unsigned char *src, int width, int height,
+                        int serial, int *serial_out) {
+    if (!src || width <= 0 || height <= 0) {
+        return;
+    }
+    if (!*tex || *tex_w != width || *tex_h != height) {
+        if (*tex) {
+            SDL_DestroyTexture(*tex);
+        }
+        *tex = SDL_CreateTexture(e->renderer, SDL_PIXELFORMAT_ARGB8888,
+                                 SDL_TEXTUREACCESS_STREAMING, width, height);
+        if (*tex) {
+            SDL_SetTextureBlendMode(*tex, SDL_BLENDMODE_BLEND);
+        }
+        *tex_w = width;
+        *tex_h = height;
+    }
+    if (*tex) {
+        SDL_UpdateTexture(*tex, NULL, src, width * 4);
+        if (serial_out) {
+            *serial_out = serial;
+        }
+    }
+}
+
+/* Pulls the newest decoded frame into the caller's persistent texture. */
+static void webm_present(Engine *e, void *player_ptr, double t,
+                         SDL_Texture **tex, int *tex_w, int *tex_h, int *serial) {
+    WebmPlayer *player = (WebmPlayer *)player_ptr;
+    if (!player) {
+        return;
+    }
+    if (e->decode_thread_live && e->decode_mutex_ready) {
+        pthread_mutex_lock(&e->decode_mutex);
+        if (e->decode_buf_serial != *serial && e->decode_buf_size > 0) {
+            webm_upload(e, tex, tex_w, tex_h,
+                        e->decode_buf[e->decode_buf_index],
+                        e->decode_buf_w, e->decode_buf_h,
+                        e->decode_buf_serial, serial);
+        }
+        pthread_mutex_unlock(&e->decode_mutex);
+    } else {
+        const unsigned char *rgba = NULL;
+        int width = 0;
+        int height = 0;
+        int next = 0;
+        if (webm_frame(player, t, &rgba, &width, &height, &next) && rgba) {
+            webm_upload(e, tex, tex_w, tex_h, rgba, width, height, next, serial);
+        }
+    }
+}
+
+static void start_webm_audio(Engine *e, WebmPlayer *player) {
+    char wav[SAVE_PATH_MAX];
+    if (!e->audio_ok || !webm_has_audio(player)) {
+        return;
+    }
+    ensure_save_dir(e);
+    snprintf(wav, sizeof(wav), "%s/video_audio.wav", e->save_dir);
+    if (webm_audio_to_wav(player, wav)) {
+        e->intro_music = Mix_LoadMUS(wav);
+        if (e->intro_music) {
+            Mix_PlayMusic(e->intro_music, 0);
+            Mix_VolumeMusic(e->opt_music * MIX_MAX_VOLUME / 10);
+            c09_trace("webm: audio decoded");
+        }
+        remove(wav);
+    }
+}
+
+static int load_webm_movie(Engine *e, const char *path, int mode) {
+    WebmPlayer *player;
+    double duration;
+    if (e->splash_webm) {
+        webm_close((WebmPlayer *)e->splash_webm);
+        e->splash_webm = NULL;
+        e->splash_is_webm = 0;
+    }
+    player = webm_open(path);
+    if (!player) {
+        return 0;
+    }
+    if (!webm_has_video(player)) {
+        webm_close(player);
+        return 0;
+    }
+    e->splash_mode = mode;
+    e->splash_is_webm = 1;
+    e->splash_webm = player;
+    e->splash_w = webm_width(player);
+    e->splash_h = webm_height(player);
+    duration = webm_duration(player);
+    if (duration < 0.05) {
+        duration = 0.05;
+    }
+    e->splash_fps = 30;
+    e->splash_frames = (int)(duration * 30.0 + 0.5);
+    if (e->splash_frames < 1) {
+        e->splash_frames = 1;
+    }
+    e->splash_tex = NULL;
+    e->splash_tex_index = -1;
+    e->splash_tex_w = 0;
+    e->splash_tex_h = 0;
+    start_webm_audio(e, player);
+    e->splash_start = SDL_GetTicks();
+    e->splash_skip_at = e->splash_start + 2500;
+    e->splash_active = 1;
+    start_decode_thread(e, player, e->splash_start, 0);
+    c09_trace("webm: %s %dx%d %.2fs", path, e->splash_w, e->splash_h, duration);
+    return 1;
+}
+
+static void stop_webm(Engine *e) {
+    if (e->splash_webm) {
+        if (e->decode_thread_live && e->decode_player == e->splash_webm) {
+            stop_decode_thread(e);
+        }
+        webm_close((WebmPlayer *)e->splash_webm);
+        e->splash_webm = NULL;
+    }
+    e->splash_is_webm = 0;
+}
+#endif
+
 static void load_splash(Engine *e) {
+#ifdef __PROSPERO__
+    char path[SAVE_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/logosplash.webm", e->game_dir);
+    if (load_webm_movie(e, path, 0)) {
+        return;
+    }
+#endif
     if (load_splash_dir(e, "videos/logosplash", 0)) {
         start_movie_audio(e);
     }
@@ -3745,16 +3986,50 @@ static int load_movie(Engine *e, const char *subdir, int mode) {
 }
 
 static int load_intro(Engine *e) {
+#ifdef __PROSPERO__
+    char path[SAVE_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/opening.webm", e->game_dir);
+    if (load_webm_movie(e, path, 1)) {
+        return 1;
+    }
+#endif
     return load_movie(e, "videos/opening", 1);
+}
+
+static int load_ending_video(Engine *e, const char *id) {
+#ifdef __PROSPERO__
+    char path[SAVE_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%send.webm", e->game_dir, id);
+    if (load_webm_movie(e, path, 2)) {
+        return 1;
+    }
+#endif
+    {
+        char subdir[64];
+        snprintf(subdir, sizeof(subdir), "videos/endings/%s", id);
+        return load_movie(e, subdir, 2);
+    }
 }
 
 static void stop_percpop(Engine *e) {
     e->percpop_active = 0;
     e->percpop_index = -1;
+#ifdef __PROSPERO__
+    if (e->percpop_webm) {
+        if (e->decode_thread_live && e->decode_player == e->percpop_webm) {
+            stop_decode_thread(e);
+        }
+        webm_close((WebmPlayer *)e->percpop_webm);
+        e->percpop_webm = NULL;
+    }
+    e->percpop_is_webm = 0;
+#endif
     if (e->percpop_tex) {
         SDL_DestroyTexture(e->percpop_tex);
         e->percpop_tex = NULL;
     }
+    e->percpop_tex_w = 0;
+    e->percpop_tex_h = 0;
 }
 
 static int load_percpop(Engine *e) {
@@ -3769,6 +4044,31 @@ static int load_percpop(Engine *e) {
     if (!e->data_dir[0]) {
         return 0;
     }
+#ifdef __PROSPERO__
+    {
+        char path[SAVE_PATH_MAX];
+        WebmPlayer *player;
+        snprintf(path, sizeof(path), "%s/percpop.webm", e->game_dir);
+        player = webm_open(path);
+        if (player && webm_has_video(player)) {
+            double duration = webm_duration(player);
+            e->percpop_is_webm = 1;
+            e->percpop_webm = player;
+            e->percpop_w = webm_width(player);
+            e->percpop_h = webm_height(player);
+            e->percpop_duration = duration > 0.05 ? duration : 0.05;
+            e->percpop_start = SDL_GetTicks();
+            e->percpop_index = -1;
+            e->percpop_active = 1;
+            start_decode_thread(e, player, e->percpop_start, 0);
+            c09_trace("percpop: webm %.2fs", duration);
+            return 1;
+        }
+        if (player) {
+            webm_close(player);
+        }
+    }
+#endif
     snprintf(e->percpop_dir, sizeof(e->percpop_dir), "%s/videos/percpop", e->data_dir);
     snprintf(manifest, sizeof(manifest), "%s/manifest.txt", e->percpop_dir);
     file = fopen(manifest, "rb");
@@ -3825,6 +4125,13 @@ static void draw_percpop(Engine *e) {
     if (index >= e->percpop_frames) {
         index = e->percpop_frames - 1;
     }
+#ifdef __PROSPERO__
+    if (e->percpop_is_webm && e->percpop_webm) {
+        double seconds = (double)elapsed / 1000.0;
+        webm_present(e, e->percpop_webm, seconds, &e->percpop_tex,
+                     &e->percpop_tex_w, &e->percpop_tex_h, &e->percpop_index);
+    } else
+#endif
     if (!e->percpop_tex || e->percpop_index != index) {
         char path[SPLASH_PATH_MAX];
         SDL_Surface *surface;
@@ -3877,6 +4184,11 @@ static void finish_splash(Engine *e) {
         e->splash_tex = NULL;
     }
     e->splash_tex_index = -1;
+    e->splash_tex_w = 0;
+    e->splash_tex_h = 0;
+#ifdef __PROSPERO__
+    stop_webm(e);
+#endif
     if (e->splash_mode == 2) {
         c09_trace("ending video: ended after %u ms", (unsigned)(SDL_GetTicks() - e->splash_start));
         stop_intro_audio(e);
@@ -3904,33 +4216,43 @@ static void draw_splash(Engine *e) {
     if (!e->splash_active) {
         return;
     }
-    index = (int)((SDL_GetTicks() - e->splash_start) * (Uint32)e->splash_fps / 1000);
-    if (index < 0) {
-        index = 0;
-    }
-    if (index >= e->splash_frames) {
-        index = e->splash_frames - 1;
-    }
-    if (!e->splash_tex || e->splash_tex_index != index) {
-        char path[SPLASH_PATH_MAX];
-        SDL_Surface *surface;
-        if (e->splash_tex) {
-            SDL_DestroyTexture(e->splash_tex);
-            e->splash_tex = NULL;
+#ifdef __PROSPERO__
+    if (e->splash_is_webm && e->splash_webm) {
+        double seconds = (double)(SDL_GetTicks() - e->splash_start) / 1000.0;
+        webm_present(e, e->splash_webm, seconds, &e->splash_tex,
+                     &e->splash_tex_w, &e->splash_tex_h, &e->splash_tex_index);
+        texture = e->splash_tex;
+    } else
+#endif
+    {
+        index = (int)((SDL_GetTicks() - e->splash_start) * (Uint32)e->splash_fps / 1000);
+        if (index < 0) {
+            index = 0;
         }
-        snprintf(path, sizeof(path), "%s/frame_%04d.jpg", e->splash_dir, index);
-        surface = IMG_Load(path);
-        if (surface) {
-            e->splash_tex = SDL_CreateTextureFromSurface(e->renderer, surface);
-            SDL_FreeSurface(surface);
+        if (index >= e->splash_frames) {
+            index = e->splash_frames - 1;
+        }
+        if (!e->splash_tex || e->splash_tex_index != index) {
+            char path[SPLASH_PATH_MAX];
+            SDL_Surface *surface;
             if (e->splash_tex) {
-                SDL_SetTextureBlendMode(e->splash_tex,
-                                        e->splash_mode ? SDL_BLENDMODE_NONE : SDL_BLENDMODE_BLEND);
+                SDL_DestroyTexture(e->splash_tex);
+                e->splash_tex = NULL;
             }
-        } else {
-            printf("class09: splash frame load failed: %s (%s)\n", path, IMG_GetError());
+            snprintf(path, sizeof(path), "%s/frame_%04d.jpg", e->splash_dir, index);
+            surface = IMG_Load(path);
+            if (surface) {
+                e->splash_tex = SDL_CreateTextureFromSurface(e->renderer, surface);
+                SDL_FreeSurface(surface);
+                if (e->splash_tex) {
+                    SDL_SetTextureBlendMode(e->splash_tex,
+                                            e->splash_mode ? SDL_BLENDMODE_NONE : SDL_BLENDMODE_BLEND);
+                }
+            } else {
+                printf("class09: splash frame load failed: %s (%s)\n", path, IMG_GetError());
+            }
+            e->splash_tex_index = index;
         }
-        e->splash_tex_index = index;
         texture = e->splash_tex;
     }
 

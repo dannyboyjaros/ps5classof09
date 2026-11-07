@@ -15,11 +15,8 @@ FOLDER CONTENTS
   sce_sys/icon0.png             launcher icon
   sce_module/libc.prx           clean-room libc runtime used by the app
   assets/script.json            exported game bytecode
-  assets/game/                  your copy of the PC game (574 files)
-  assets/videos/logosplash/     252 startup-video frames + manifest.txt
-  assets/videos/opening/        opening movie frames + audio + manifest.txt
-  assets/videos/endings/        the 15 ending videos as frames + audio
-  GAME_FILES.txt                exact list of the 515 game files in assets/game
+  assets/game/                  your copy of the PC game (589 files)
+  GAME_FILES.txt                exact list of the 589 game files in assets/game
 
 INSTALL ON THE PS5
 ------------------
@@ -39,24 +36,25 @@ whole folder, and the runtime reads its data from /app0/assets.
 
 WHICH ORIGINAL GAME FILES ARE USED
 ----------------------------------
-The runtime uses your own legally obtained copy of Class of '09. The exact 574
+The runtime uses your own legally obtained copy of Class of '09. The exact 589
 relative paths are listed in GAME_FILES.txt. Copy them from the PC install's
 game/ folder into assets/game/ with the same relative paths, for example:
 
     PC:      Class of 09\game\images\home nicole.jpg
     PS5:     /data/homebrew/PPSA09009/assets/game/images/home nicole.jpg
 
-The 574 files are 405.9 MB: 304 images, 185 audio files, 17 gui files,
-6 fonts, 59 "new message" animation frames, and 3 .webm files. Caches, saves,
-translations, .rpyc files, unused fonts, and the ending videos are deliberately
-not included as game files; they are supplied below as extracted frames.
+The 589 files are 678.4 MB: 304 images, 185 audio files, 17 gui files,
+6 fonts, 59 "new message" animation frames, and 18 .webm videos. Caches,
+saves, translations, .rpyc files, and unused fonts are deliberately not
+included.
 
-Four generated data trees are also present:
+The videos are the game's own WebM files (logosplash, opening, percpop and
+the 15 ending videos). The runtime decodes them directly with libvpx (VP8)
+and libvorbis (Vorbis audio), so no frame folders are generated or needed.
+
+One generated data file is also present:
 
   assets/script.json              exported by tools/export_script.py
-  assets/videos/logosplash/       frames extracted from logosplash.webm
-  assets/videos/opening/          frames and audio extracted from opening.webm
-  assets/videos/endings/<id>/     frames and audio for each ending video
 
 CONTROLS
 --------
