@@ -204,6 +204,25 @@ static double obj_num(JsonValue *object, const char *key, double def) {
     return json_as_number(value);
 }
 
+/* ATL keyframes are exported as {"value": [[time,x,y,w,h,alpha,flip], ...],
+ * "Count": n}; older exports used the bare array.  Accept both. */
+static JsonValue *anim_frames(JsonValue *frames) {
+    JsonValue *value;
+    if (!frames) {
+        return NULL;
+    }
+    if (frames->type == JL_ARRAY) {
+        return frames;
+    }
+    if (frames->type == JL_OBJECT) {
+        value = obj_get(frames, "value");
+        if (value && value->type == JL_ARRAY) {
+            return value;
+        }
+    }
+    return NULL;
+}
+
 static int label_index(Engine *e, const char *name) {
     JsonValue *value;
     if (!name || !name[0]) {
@@ -1417,10 +1436,22 @@ static void set_item(Engine *e, const char *rel, const char *tag, const char *la
     int index = find_item(e, tag, layer);
     int order = 0;
     int i;
+    int keep_position = 0;
+    int keep_x = 0;
+    int keep_y = 0;
     LayerItem *item;
 
     if (index >= 0) {
         order = e->items[index].order;
+        /* A bare `show <tag>` keeps Ren'Py's current transform, but the
+         * exporter re-emits the default center.  Keep the gamer brother at
+         * his existing spot while Mom is in the scene so he does not slide on
+         * top of Nicole and Mom; the next scene stages him normally. */
+        if (strcmp(tag, "gamer_brother") == 0 && find_item(e, "mom", layer) >= 0) {
+            keep_position = 1;
+            keep_x = e->items[index].x;
+            keep_y = e->items[index].y;
+        }
     }
     if (index < 0) {
         for (i = 0; i < MAX_ITEMS; i++) {
@@ -1441,8 +1472,8 @@ static void set_item(Engine *e, const char *rel, const char *tag, const char *la
     copy_str(item->kind, sizeof(item->kind), kind ? kind : "none");
     copy_str(item->rel, sizeof(item->rel), rel ? rel : "");
     copy_str(item->arg, sizeof(item->arg), arg ? arg : "");
-    item->x = x;
-    item->y = y;
+    item->x = keep_position ? keep_x : x;
+    item->y = keep_position ? keep_y : y;
     item->w = w;
     item->h = h;
     item->alpha = alpha < 0 ? 0 : (alpha > 255 ? 255 : alpha);
@@ -1450,7 +1481,8 @@ static void set_item(Engine *e, const char *rel, const char *tag, const char *la
     item->order = order ? order : ++e->next_order;
     item->anim_count = 0;
     item->anim_paused = 0;
-    if (frames && frames->type == JL_ARRAY && frames->u.array.count >= 2) {
+    frames = anim_frames(frames);
+    if (frames && frames->u.array.count >= 2) {
         size_t total = frames->u.array.count;
         for (i = 0; i < (int)total && item->anim_count < MAX_ANIM; i++) {
             JsonValue *frame = frames->u.array.items[i];
@@ -1859,8 +1891,8 @@ static void execute_op(Engine *e) {
         const char *item_arg = op_str(op, 5);
         e->pc++;
         if (strcmp(item_kind, "movie") == 0 && strstr(item_arg, "percpop")) {
-            JsonValue *frames = op_item(op, 12);
-            int animated = frames && frames->type == JL_ARRAY && frames->u.array.count > 0;
+            JsonValue *frames = anim_frames(op_item(op, 12));
+            int animated = frames && frames->u.array.count > 0;
             /* The second percpop show has alpha 0 and no keyframes: stay hidden. */
             if (animated || op_num(op, 10) > 0.01) {
                 load_percpop(e);
@@ -2388,7 +2420,7 @@ static void handle_action(Engine *e, int action) {
         }
         break;
     case ACT_ENDINGS:
-        if (e->mode == MODE_MENU && e->seen_count > 0) {
+        if (e->mode == MODE_MENU) {
             enter_endings(e);
         } else if (e->mode == MODE_ENDINGS) {
             on_back(e);
@@ -2669,6 +2701,7 @@ static void draw_item(Engine *e, LayerItem *item) {
 
 static void draw_dialogue(Engine *e) {
     int textbox_h = 0;
+    int drop = 0;
     if (!e->hud) {
         return;
     }
@@ -2685,15 +2718,69 @@ static void draw_dialogue(Engine *e) {
         }
     }
     if (textbox_h == 0) {
+        textbox_h = 278;
         fill_rect(e, 0, SCREEN_H - 278, SCREEN_W, 278, 0x000000, 170);
     }
+    /* The shipped textbox art is 229 px tall (top edge at y=851) while the
+     * name line is positioned at y=806 for the 278 px GUI layout.  Drop the
+     * name and dialogue together so they sit on the visible paper. */
+    drop = (SCREEN_H - textbox_h + 2) - e->gui_name_y;
+    if (drop < 0) {
+        drop = 0;
+    }
+    if (drop > 60) {
+        drop = 60;
+    }
     if (e->speaker[0]) {
-        draw_text(e, FONT_NAME, e->speaker, e->gui_name_color, 0, e->gui_name_x, e->gui_name_y, 0, 0);
+        draw_text(e, FONT_NAME, e->speaker, e->gui_name_color, 0, e->gui_name_x, e->gui_name_y + drop, 0, 0);
     }
     if (e->line[0]) {
         draw_text(e, FONT_DIALOGUE, e->line, e->gui_dialogue_color, e->gui_dialogue_w, e->gui_dialogue_x,
-                  e->gui_dialogue_y, 0, e->gui_dialogue_spacing);
+                  e->gui_dialogue_y + drop, 0, e->gui_dialogue_spacing);
     }
+}
+
+/* Width of the widest '\n'-separated line, so designed two-line choices keep
+ * their breaks instead of being re-wrapped. */
+static int widest_line(TTF_Font *font, const char *text) {
+    char line[512];
+    int widest = 0;
+    const char *p = text;
+    if (!font || !text) {
+        return 0;
+    }
+    for (;;) {
+        const char *end = strchr(p, '\n');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        int w = 0;
+        int h = 0;
+        if (len >= sizeof(line)) {
+            len = sizeof(line) - 1;
+        }
+        memcpy(line, p, len);
+        line[len] = 0;
+        if (TTF_SizeUTF8(font, line, &w, &h) == 0 && w > widest) {
+            widest = w;
+        }
+        if (!end) {
+            break;
+        }
+        p = end + 1;
+    }
+    return widest;
+}
+
+/* Largest choice font whose widest line fits the button. */
+static int fit_choice_font(Engine *e, const char *text, int max_width) {
+    static const int ids[] = {FONT_CHOICE, FONT_CHOICE_SMALL, FONT_CHOICE_TINY, FONT_CHOICE_MINI};
+    int i;
+    for (i = 0; i < (int)(sizeof(ids) / sizeof(ids[0])); i++) {
+        TTF_Font *font = ensure_font(e, ids[i]);
+        if (font && widest_line(font, text) <= max_width) {
+            return ids[i];
+        }
+    }
+    return ids[(int)(sizeof(ids) / sizeof(ids[0])) - 1];
 }
 
 static void draw_choices(Engine *e) {
@@ -2709,19 +2796,12 @@ static void draw_choices(Engine *e) {
         Uint32 color = (i == e->choice_index) ? e->gui_choice_hover_color : e->gui_choice_idle_color;
         const char *background = (i == e->choice_index) ? e->gui_choice_hover : e->gui_choice_idle;
         TextBlock *block;
-        TTF_Font *font;
         int height;
-        int text_width = 0;
-        int text_height = 0;
-        int text_font = FONT_CHOICE;
+        int text_font;
         /* The shipped button art is 1185 px wide with transparent margins; the
-         * visible strip is ~766 px, so wrap and shrink text to that width. */
+         * visible strip is ~766 px, so shrink text to that width. */
         const int wrap = 720;
-        font = ensure_font(e, FONT_CHOICE);
-        if (font && TTF_SizeUTF8(font, e->choice_text[i], &text_width, &text_height) == 0 &&
-            text_width > wrap) {
-            text_font = FONT_CHOICE_SMALL;
-        }
+        text_font = fit_choice_font(e, e->choice_text[i], wrap);
         block = text_block(e, text_font, e->choice_text[i], color, wrap);
         height = block_height(e, block, 0);
         if (height + 12 > row_h) {
@@ -3090,10 +3170,14 @@ static void draw_endings(Engine *e) {
                 draw_image(e, "gui/ending_tracker/highlight_bar.png", 593, y, 663, 36, 255, 0);
             }
             snprintf(row, sizeof(row), "%s", obj_str(item, "title", "UNKNOWN"));
-            if (strlen(row) > 26) {
-                copy_str(row + 23, 4, "...");
+            {
+                int row_font = FONT_TRACKER;
+                TTF_Font *row_face = ensure_font(e, FONT_TRACKER);
+                if (row_face && widest_line(row_face, row) > 650) {
+                    row_font = FONT_TRACKER_SMALL;
+                }
+                draw_text(e, row_font, row, i == e->endings_index ? 0xFFFFFF : 0x000000, 0, 606, y + 5, 0, 0);
             }
-            draw_text(e, FONT_TRACKER, row, i == e->endings_index ? 0xFFFFFF : 0x000000, 0, 606, y + 5, 0, 0);
         }
     }
     if (e->seen_count == 0) {
@@ -3264,15 +3348,21 @@ static void load_gui(Engine *e) {
     copy_str(e->font_paths[FONT_CHOICE], MAX_PATH, "HELVETICA_LT_NARROW.TTF");
     copy_str(e->font_paths[FONT_MENU], MAX_PATH, "FUTURA.TTF");
     copy_str(e->font_paths[FONT_CHOICE_SMALL], MAX_PATH, "HELVETICA_LT_NARROW.TTF");
+    copy_str(e->font_paths[FONT_CHOICE_TINY], MAX_PATH, "HELVETICA_LT_NARROW.TTF");
+    copy_str(e->font_paths[FONT_CHOICE_MINI], MAX_PATH, "HELVETICA_LT_NARROW.TTF");
     e->font_sizes[FONT_DIALOGUE] = 50;
     e->font_sizes[FONT_NAME] = 60;
     e->font_sizes[FONT_CHOICE] = 60;
     e->font_sizes[FONT_MENU] = 60;
     e->font_sizes[FONT_CHOICE_SMALL] = 48;
+    e->font_sizes[FONT_CHOICE_TINY] = 40;
+    e->font_sizes[FONT_CHOICE_MINI] = 30;
     copy_str(e->font_paths[FONT_MONO], MAX_PATH, "joystix monospace.ttf");
     copy_str(e->font_paths[FONT_PHONE], MAX_PATH, "texting2007.ttf");
     copy_str(e->font_paths[FONT_BODY_TINY], MAX_PATH, "HELVETICA_LT_NARROW.TTF");
     copy_str(e->font_paths[FONT_TRACKER], MAX_PATH, "HELVETICA_LT_NARROW.TTF");
+    copy_str(e->font_paths[FONT_TRACKER_SMALL], MAX_PATH, "HELVETICA_LT_NARROW.TTF");
+    e->font_sizes[FONT_TRACKER_SMALL] = 16;
     e->font_sizes[FONT_MONO] = 48;
     e->font_sizes[FONT_PHONE] = 40;
     e->font_sizes[FONT_BODY_TINY] = 26;
@@ -3321,6 +3411,10 @@ static void load_gui(Engine *e) {
             e->font_sizes[FONT_CHOICE] = obj_int(choice, "size", 60);
             copy_str(e->font_paths[FONT_CHOICE_SMALL], MAX_PATH, e->font_paths[FONT_CHOICE]);
             e->font_sizes[FONT_CHOICE_SMALL] = e->font_sizes[FONT_CHOICE] * 4 / 5;
+            copy_str(e->font_paths[FONT_CHOICE_TINY], MAX_PATH, e->font_paths[FONT_CHOICE]);
+            e->font_sizes[FONT_CHOICE_TINY] = e->font_sizes[FONT_CHOICE] * 2 / 3;
+            copy_str(e->font_paths[FONT_CHOICE_MINI], MAX_PATH, e->font_paths[FONT_CHOICE]);
+            e->font_sizes[FONT_CHOICE_MINI] = e->font_sizes[FONT_CHOICE] / 2;
         }
         menu = obj_get(gui, "menu");
         if (menu && menu->type == JL_OBJECT) {
@@ -4012,6 +4106,9 @@ static int load_ending_video(Engine *e, const char *id) {
 }
 
 static void stop_percpop(Engine *e) {
+    if (e->percpop_active) {
+        c09_trace("percpop: stop after %u ms", (unsigned)(SDL_GetTicks() - e->percpop_start));
+    }
     e->percpop_active = 0;
     e->percpop_index = -1;
 #ifdef __PROSPERO__
@@ -4118,6 +4215,7 @@ static void draw_percpop(Engine *e) {
     now = SDL_GetTicks();
     elapsed = now - e->percpop_start;
     if (elapsed >= 7200) {
+        c09_trace("percpop: timeout %u ms", (unsigned)elapsed);
         stop_percpop(e);
         return;
     }
@@ -4156,7 +4254,20 @@ static void draw_percpop(Engine *e) {
         dst.y = 0;
         dst.w = SCREEN_W;
         dst.h = SCREEN_H;
-        alpha = (int)(255.0 * (7200.0 - (double)elapsed) / 7200.0);
+        /* Keep the cutscene background fully black for the whole clip, then
+         * fade out at the very end instead of revealing gameplay under it. */
+        {
+            double duration = e->percpop_duration > 0.1 ? e->percpop_duration : 5.9;
+            double seconds = (double)elapsed / 1000.0;
+            const double fade = 0.35;
+            if (seconds >= duration) {
+                alpha = 0;
+            } else if (seconds <= duration - fade) {
+                alpha = 255;
+            } else {
+                alpha = (int)(255.0 * (duration - seconds) / fade);
+            }
+        }
         SDL_SetTextureAlphaMod(e->percpop_tex, (Uint8)alpha);
         SDL_RenderCopy(e->renderer, e->percpop_tex, NULL, &dst);
         SDL_SetTextureAlphaMod(e->percpop_tex, 255);
